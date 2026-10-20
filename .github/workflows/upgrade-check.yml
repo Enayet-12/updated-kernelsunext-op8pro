@@ -1,4 +1,4 @@
-name: Verify Singularity and KernelSU Next
+name: Build Singularity - KernelSU Next v3.4.2
 
 on:
   workflow_dispatch:
@@ -7,20 +7,29 @@ permissions:
   contents: read
 
 concurrency:
-  group: singularity-ksunext-inspection
-  cancel-in-progress: true
+  group: singularity-kernel-build
+  cancel-in-progress: false
 
 jobs:
-  inspect:
-    name: Inspect KernelSU Next and Singularity
+  build:
+    name: Build OnePlus 8 Pro ARM64 Kernel
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 360
 
     steps:
-      - name: Install inspection tools
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git findutils grep coreutils
+          sudo apt-get install -y \
+            git bc bison flex \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev \
+            libncurses-dev \
+            python3 python3-pip \
+            rsync cpio zip unzip \
+            pahole
 
       - name: Checkout Singularity
         run: |
@@ -31,168 +40,163 @@ jobs:
             https://github.com/The-Anomalist/Singularity.git \
             kernel
 
-      - name: Verify KernelSU Next v3.4.2
+      - name: Select KernelSU Next v3.4.2
         working-directory: kernel/KernelSU-Next
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "========================================"
-          echo "KERNELSU NEXT RELEASE VERIFICATION"
-          echo "========================================"
-
           git fetch --force --tags \
             https://github.com/KernelSU-Next/KernelSU-Next.git \
             'refs/tags/v3.4.2:refs/tags/v3.4.2'
-
-          if ! git rev-parse --verify \
-            'refs/tags/v3.4.2^{commit}' >/dev/null; then
-            echo "::error::KernelSU Next v3.4.2 tag was not found."
-            exit 1
-          fi
 
           TAG_COMMIT="$(git rev-parse 'refs/tags/v3.4.2^{commit}')"
 
           git checkout --detach "$TAG_COMMIT"
 
-          HEAD_COMMIT="$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "$TAG_COMMIT"
 
-          echo
-          echo "Release tag: v3.4.2"
-          echo "Tag commit:  $TAG_COMMIT"
-          echo "HEAD commit: $HEAD_COMMIT"
+          echo "KernelSU Next tag: v3.4.2"
+          echo "KernelSU Next commit: $TAG_COMMIT"
 
-          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
-            echo "::error::Checked-out commit does not match v3.4.2."
-            exit 1
-          fi
-
-          echo
-          echo "Commit details:"
-          git log -1 --format=fuller
-
-          echo
-          echo "Release verification passed."
-
-      - name: Inspect Singularity build configuration
+      - name: Identify kernel configuration
+        id: config
         working-directory: kernel
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "========================================"
-          echo "SINGULARITY SOURCE INFORMATION"
-          echo "========================================"
+          echo "Available candidate defconfigs:"
+          find arch/arm64/configs -type f \
+            \( -iname '*kona*defconfig' \
+            -o -iname '*sm8250*defconfig' \
+            -o -iname '*instantnoodlep*defconfig' \) \
+            -print | sort
 
-          echo
-          echo "Current commit:"
+          CONFIG=""
+
+          for candidate in \
+            vendor/kona-perf_defconfig \
+            vendor/kona_defconfig \
+            kona-perf_defconfig \
+            kona_defconfig \
+            vendor/instantnoodlep_defconfig \
+            instantnoodlep_defconfig
+          do
+            if [ -f "arch/arm64/configs/$candidate" ]; then
+              CONFIG="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$CONFIG" ]; then
+            echo "::error::No recognized Kona/SM8250 defconfig found."
+            echo "Review the candidate list above and select the correct config."
+            exit 1
+          fi
+
+          echo "Selected defconfig: $CONFIG"
+          echo "defconfig=$CONFIG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify kernel integration
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== Kernel revision ====="
           git log -1 --oneline
 
           echo
-          echo "Git submodules:"
-          cat .gitmodules || true
+          echo "===== Kernel version ====="
+          grep -E \
+            '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)[[:space:]]*=' \
+            Makefile || true
 
           echo
-          echo "Submodule status:"
-          git submodule status || true
-
-          echo
-          echo "========================================"
-          echo "BUILD SCRIPTS AND CONFIGURATION FILES"
-          echo "========================================"
-
-          find . -maxdepth 3 -type f \
-            \( -name 'build.sh' \
-            -o -name 'Makefile' \
-            -o -name '*defconfig' \
-            -o -name '*.config' \
-            -o -name 'build.config*' \) \
-            -print > /tmp/build-files.txt
-
-          sed -n '1,200p' /tmp/build-files.txt
-
-          echo
-          echo "========================================"
-          echo "ARM64 DEVICE CONFIGURATIONS"
-          echo "========================================"
-
-          if [ -d arch/arm64/configs ]; then
-            find arch/arm64/configs -type f \
-              \( -iname '*kona*' \
-              -o -iname '*oneplus*' \
-              -o -iname '*instantnoodlep*' \
-              -o -iname '*sm8250*' \) \
-              -print > /tmp/arm64-configs.txt
-
-            if [ -s /tmp/arm64-configs.txt ]; then
-              cat /tmp/arm64-configs.txt
-            else
-              echo "No matching configuration filenames found."
-              echo "Listing configuration files for manual inspection:"
-              find arch/arm64/configs -maxdepth 3 -type f \
-                -print > /tmp/all-arm64-configs.txt
-              sed -n '1,160p' /tmp/all-arm64-configs.txt
-            fi
-          else
-            echo "arch/arm64/configs was not found at the repository root."
-            echo "Inspecting repository directories:"
-            find . -maxdepth 3 -type d \
-              -path '*/arch/arm64/configs' \
-              -print
-          fi
-
-          echo
-          echo "========================================"
-          echo "KERNELSU INTEGRATION REFERENCES"
-          echo "========================================"
-
+          echo "===== KernelSU references ====="
           git grep -n -i -E \
-            'kernelsu|ksunext|ksu' \
-            -- ':!KernelSU-Next' \
-            > /tmp/ksu-references.txt || true
-
-          if [ -s /tmp/ksu-references.txt ]; then
-            sed -n '1,200p' /tmp/ksu-references.txt
-          else
-            echo "No tracked KernelSU references found outside the submodule."
-          fi
+            'KernelSU-Next/kernel|kernelsu|ksunext' \
+            -- ':!KernelSU-Next' || true
 
           echo
-          echo "========================================"
-          echo "KERNEL VERSION INFORMATION"
-          echo "========================================"
-
-          if [ -f Makefile ]; then
-            grep -n -E \
-              '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)[[:space:]]*=' \
-              Makefile || true
-          else
-            echo "No top-level kernel Makefile found."
-          fi
+          echo "===== KernelSU source ====="
+          git -C KernelSU-Next log -1 --oneline
 
           echo
-          echo "Inspection completed."
+          echo "===== Selected defconfig ====="
+          echo "${{ steps.config.outputs.defconfig }}"
 
-      - name: Summarize inspected source revisions
-        if: always()
+      - name: Configure kernel
+        working-directory: kernel
+        shell: bash
+        env:
+          DEFCONFIG: ${{ steps.config.outputs.defconfig }}
+        run: |
+          set -euo pipefail
+
+          make O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            "$DEFCONFIG"
+
+          echo "===== KernelSU configuration ====="
+          grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_MODULES' \
+            "$GITHUB_WORKSPACE/out/.config" || true
+
+          echo "===== Device configuration ====="
+          grep -E \
+            'CONFIG_ARCH_QCOM|CONFIG_ARM64|CONFIG_OF=' \
+            "$GITHUB_WORKSPACE/out/.config" || true
+
+      - name: Compile kernel
+        working-directory: kernel
         shell: bash
         run: |
-          echo "========================================"
-          echo "INSPECTION SUMMARY"
-          echo "========================================"
+          set -euo pipefail
 
-          if [ -d kernel/.git ]; then
-            echo "Singularity checkout exists."
-            git -C kernel log -1 --oneline || true
+          make -j"$(nproc)" \
+            O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image.gz-dtb
+
+      - name: Verify build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== Output files ====="
+          find out/arch/arm64/boot -maxdepth 2 -type f -print
+
+          IMAGE="out/arch/arm64/boot/Image.gz-dtb"
+
+          if [ ! -s "$IMAGE" ]; then
+            echo "::error::Image.gz-dtb was not produced."
+            exit 1
           fi
 
-          if [ -d kernel/KernelSU-Next ]; then
-            echo
-            echo "KernelSU Next checkout:"
-            git -C kernel/KernelSU-Next log -1 --oneline || true
-            git -C kernel/KernelSU-Next describe \
-              --tags --exact-match HEAD 2>/dev/null || true
-          fi
+          mkdir -p release
+          cp "$IMAGE" release/Image.gz-dtb
 
-          echo
-          echo "No kernel compilation or artifact installation was performed."
+          sha256sum release/Image.gz-dtb \
+            | tee release/SHA256SUMS
+
+          {
+            echo "Singularity branch: event-horizon"
+            echo "Device target: OnePlus 8 Pro (instantnoodlep)"
+            echo "KernelSU Next tag: v3.4.2"
+            echo "Kernel commit:"
+            git -C kernel rev-parse HEAD
+            echo "KernelSU Next commit:"
+            git -C kernel/KernelSU-Next rev-parse HEAD
+            echo "Defconfig: ${{ steps.config.outputs.defconfig }}"
+          } > release/BUILD-INFO.txt
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: singularity-instantnoodlep-ksunext-v3.4.2
+          path: release/
+          if-no-files-found: error
+          retention-days: 14

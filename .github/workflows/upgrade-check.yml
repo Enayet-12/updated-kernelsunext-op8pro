@@ -7,73 +7,226 @@ permissions:
   contents: read
 
 concurrency:
-  group: singularity-kernel-build
+  group: singularity-ksunext-build
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build OnePlus 8 Pro ARM64 Kernel
-    runs-on: ubuntu-24.04
+    name: Build SM8250 Kernel
+    runs-on: ubuntu-22.04
     timeout-minutes: 360
 
+    env:
+      REAL_CLANG: ${{ github.workspace }}/clang/bin/clang
+      REAL_GCC: /usr/bin/gcc
+      REAL_GXX: /usr/bin/g++
+
     steps:
+      # ==========================================
+      # 1. INSTALL DEPENDENCIES
+      # ==========================================
       - name: Install build dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            git bc bison flex build-essential \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev libncurses-dev \
-            python3 python3-pip rsync cpio zip unzip pahole
 
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            git \
+            curl \
+            ca-certificates \
+            bc \
+            bison \
+            flex \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            binutils-arm-linux-gnueabi \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            libxml2-utils \
+            device-tree-compiler \
+            python3 \
+            rsync \
+            cpio \
+            zip \
+            unzip \
+            pahole \
+            zlib1g-dev
+
+      # ==========================================
+      # 2. CHECK OUT SINGULARITY AND SUBMODULES
+      # ==========================================
       - name: Checkout Singularity
         shell: bash
         run: |
           set -euo pipefail
+
           git clone \
             --branch event-horizon \
             --recurse-submodules \
             --depth 1 \
+            --shallow-submodules \
             https://github.com/The-Anomalist/Singularity.git \
             kernel
+
+          echo "Singularity commit:"
           git -C kernel log -1 --oneline
 
+          echo
+          echo "Submodule status:"
+          git -C kernel submodule status
+
+          if [ ! -d kernel/KernelSU-Next ]; then
+            echo "::error::KernelSU-Next submodule is missing."
+            exit 1
+          fi
+
+      # ==========================================
+      # 3. CHECK OUT KERNELSU NEXT V3.4.2
+      # ==========================================
       - name: Select KernelSU Next v3.4.2
         working-directory: kernel/KernelSU-Next
         shell: bash
         run: |
           set -euo pipefail
+
           git fetch --force --tags \
             https://github.com/KernelSU-Next/KernelSU-Next.git \
             'refs/tags/v3.4.2:refs/tags/v3.4.2'
+
           TAG_COMMIT="$(git rev-parse 'refs/tags/v3.4.2^{commit}')"
+
           git checkout --detach "$TAG_COMMIT"
-          test "$(git rev-parse HEAD)" = "$TAG_COMMIT"
+
+          if [ "$(git rev-parse HEAD)" != "$TAG_COMMIT" ]; then
+            echo "::error::KernelSU Next version verification failed."
+            exit 1
+          fi
+
+          echo "KernelSU Next version: v3.4.2"
           echo "KernelSU Next commit: $TAG_COMMIT"
 
-      - name: Identify kernel configuration
+      # ==========================================
+      # 4. DOWNLOAD CLANG 12.0.7
+      # ==========================================
+      - name: Install Clang 12.0.7
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+
+          curl --fail --location --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b1.tar.gz" \
+            --output "$RUNNER_TEMP/clang.tar.gz"
+
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" \
+            -C "$GITHUB_WORKSPACE/clang"
+
+          "$GITHUB_WORKSPACE/clang/bin/clang" --version
+
+      # ==========================================
+      # 5. CREATE COMPILER WRAPPERS
+      #    STRIP ALL -WERROR ARGUMENTS
+      # ==========================================
+      - name: Create warning-safe compiler wrappers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/toolwrap"
+
+          cat > "$GITHUB_WORKSPACE/toolwrap/clang-no-werror" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          args=()
+
+          for arg in "$@"; do
+            case "$arg" in
+              -Werror|-Werror=*)
+                ;;
+              *)
+                args+=("$arg")
+                ;;
+            esac
+          done
+
+          exec "${REAL_CLANG:?REAL_CLANG is not set}" "${args[@]}"
+          EOF
+
+          cat > "$GITHUB_WORKSPACE/toolwrap/gcc-no-werror" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          args=()
+
+          for arg in "$@"; do
+            case "$arg" in
+              -Werror|-Werror=*)
+                ;;
+              *)
+                args+=("$arg")
+                ;;
+            esac
+          done
+
+          exec "${REAL_GCC:?REAL_GCC is not set}" "${args[@]}"
+          EOF
+
+          cat > "$GITHUB_WORKSPACE/toolwrap/gxx-no-werror" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          args=()
+
+          for arg in "$@"; do
+            case "$arg" in
+              -Werror|-Werror=*)
+                ;;
+              *)
+                args+=("$arg")
+                ;;
+            esac
+          done
+
+          exec "${REAL_GXX:?REAL_GXX is not set}" "${args[@]}"
+          EOF
+
+          chmod +x "$GITHUB_WORKSPACE/toolwrap/"*
+
+          echo "Compiler wrappers created."
+
+      # ==========================================
+      # 6. VERIFY SOURCE AND CONFIGURATION
+      # ==========================================
+      - name: Identify device defconfig
         id: config
         working-directory: kernel
         shell: bash
         run: |
           set -euo pipefail
 
-          find arch/arm64/configs -type f \
+          echo "Available Kona configurations:"
+
+          find arch/arm64/configs \
+            -type f \
             \( -iname '*kona*defconfig' \
             -o -iname '*sm8250*defconfig' \
             -o -iname '*instantnoodlep*defconfig' \) \
             -print | sort
 
           CONFIG=""
+
           for candidate in \
             vendor/kona-perf_defconfig \
             vendor/kona_defconfig \
             kona-perf_defconfig \
-            kona_defconfig \
-            vendor/instantnoodlep_defconfig \
-            instantnoodlep_defconfig
+            kona_defconfig
           do
             if [ -f "arch/arm64/configs/$candidate" ]; then
               CONFIG="$candidate"
@@ -82,13 +235,17 @@ jobs:
           done
 
           if [ -z "$CONFIG" ]; then
-            echo "::error::No recognized device defconfig found."
+            echo "::error::No expected Kona defconfig found."
+            echo "Stopping rather than selecting an unrelated configuration."
             exit 1
           fi
 
           echo "Selected defconfig: $CONFIG"
           echo "defconfig=$CONFIG" >> "$GITHUB_OUTPUT"
 
+      # ==========================================
+      # 7. CONFIGURE THE KERNEL
+      # ==========================================
       - name: Configure kernel
         working-directory: kernel
         shell: bash
@@ -97,73 +254,145 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/out"
+          OUT="$GITHUB_WORKSPACE/kernel/out"
+          WRAP="$GITHUB_WORKSPACE/toolwrap"
 
-          make \
-            O="$GITHUB_WORKSPACE/out" \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            "$DEFCONFIG"
+          mkdir -p "$OUT"
 
-      - name: Disable WERROR configuration
-        working-directory: kernel
-        shell: bash
-        run: |
-          set -euo pipefail
+          COMMON_ARGS=(
+            "O=$OUT"
+            "ARCH=arm64"
+            "CC=$WRAP/clang-no-werror"
+            "HOSTCC=$WRAP/gcc-no-werror"
+            "HOSTCXX=$WRAP/gxx-no-werror"
+            "CROSS_COMPILE=aarch64-linux-gnu-"
+            "CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+            "CLANG_TRIPLE=aarch64-linux-gnu-"
+            "LD=aarch64-linux-gnu-ld"
+            "AR=$GITHUB_WORKSPACE/clang/bin/llvm-ar"
+            "NM=$GITHUB_WORKSPACE/clang/bin/llvm-nm"
+            "OBJCOPY=$GITHUB_WORKSPACE/clang/bin/llvm-objcopy"
+            "OBJDUMP=$GITHUB_WORKSPACE/clang/bin/llvm-objdump"
+            "STRIP=$GITHUB_WORKSPACE/clang/bin/llvm-strip"
+            "LLVM_IAS=1"
+          )
 
-          CONFIG="$GITHUB_WORKSPACE/out/.config"
+          make "${COMMON_ARGS[@]}" "$DEFCONFIG"
 
-          if grep -qE \
-            '^(CONFIG_WERROR=|# CONFIG_WERROR is not set)' \
-            "$CONFIG"; then
-            scripts/config --file "$CONFIG" --disable WERROR
+          # Merge the optional OnePlus config fragment if present.
+          if [ -f arch/arm64/configs/vendor/oplus.config ]; then
+            echo "Merging vendor/oplus.config"
 
-            make \
-              O="$GITHUB_WORKSPACE/out" \
-              ARCH=arm64 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              olddefconfig
+            scripts/kconfig/merge_config.sh \
+              -m \
+              -O "$OUT" \
+              "$OUT/.config" \
+              arch/arm64/configs/vendor/oplus.config
+
+            make "${COMMON_ARGS[@]}" olddefconfig
           fi
 
-          grep -E '^(CONFIG_WERROR=|# CONFIG_WERROR is not set)' \
-            "$CONFIG" || true
+          # Disable CONFIG_WERROR if this kernel defines it.
+          if grep -qE \
+            '^(CONFIG_WERROR=|# CONFIG_WERROR is not set)' \
+            "$OUT/.config"; then
 
-      - name: Compile kernel without warning errors
+            scripts/config \
+              --file "$OUT/.config" \
+              --disable WERROR
+
+            make "${COMMON_ARGS[@]}" olddefconfig
+          fi
+
+          echo
+          echo "===== Configuration summary ====="
+
+          grep -E \
+            '^(CONFIG_WERROR=|# CONFIG_WERROR is not set|CONFIG_KSU=|CONFIG_KPROBES=|CONFIG_KPROBE_EVENTS=)' \
+            "$OUT/.config" || true
+
+          echo
+          echo "Configuration complete."
+
+      # ==========================================
+      # 8. BUILD THE KERNEL
+      # ==========================================
+      - name: Compile kernel
         working-directory: kernel
         shell: bash
         run: |
           set -euo pipefail
 
-          export KCFLAGS="-Wno-error"
-          export CFLAGS_KERNEL="-Wno-error"
-          export CFLAGS_MODULE="-Wno-error"
+          OUT="$GITHUB_WORKSPACE/kernel/out"
+          WRAP="$GITHUB_WORKSPACE/toolwrap"
+
+          COMMON_ARGS=(
+            "O=$OUT"
+            "ARCH=arm64"
+            "CC=$WRAP/clang-no-werror"
+            "HOSTCC=$WRAP/gcc-no-werror"
+            "HOSTCXX=$WRAP/gxx-no-werror"
+            "CROSS_COMPILE=aarch64-linux-gnu-"
+            "CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+            "CLANG_TRIPLE=aarch64-linux-gnu-"
+            "LD=aarch64-linux-gnu-ld"
+            "AR=$GITHUB_WORKSPACE/clang/bin/llvm-ar"
+            "NM=$GITHUB_WORKSPACE/clang/bin/llvm-nm"
+            "OBJCOPY=$GITHUB_WORKSPACE/clang/bin/llvm-objcopy"
+            "OBJDUMP=$GITHUB_WORKSPACE/clang/bin/llvm-objdump"
+            "STRIP=$GITHUB_WORKSPACE/clang/bin/llvm-strip"
+            "LLVM_IAS=1"
+            "KCFLAGS=-Wno-error"
+            "CFLAGS_KERNEL=-Wno-error"
+            "CFLAGS_MODULE=-Wno-error"
+          )
+
+          echo "===== Build configuration ====="
+          "$REAL_CLANG" --version
+          echo "KernelSU Next: v3.4.2"
+          echo "Warnings remain visible; -Werror arguments are filtered."
+
+          echo
+          echo "===== Starting kernel build ====="
 
           make -j"$(nproc)" \
-            O="$GITHUB_WORKSPACE/out" \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-Wno-error" \
-            CFLAGS_KERNEL="-Wno-error" \
-            CFLAGS_MODULE="-Wno-error" \
+            "${COMMON_ARGS[@]}" \
             Image.gz-dtb
 
+      # ==========================================
+      # 9. VERIFY THE OUTPUT
+      # ==========================================
       - name: Verify kernel image
         shell: bash
         run: |
           set -euo pipefail
 
-          IMAGE="out/arch/arm64/boot/Image.gz-dtb"
+          IMAGE="$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image.gz-dtb"
+
+          echo "===== Generated boot files ====="
+
+          find "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot" \
+            -maxdepth 2 \
+            -type f \
+            -print
 
           if [ ! -s "$IMAGE" ]; then
-            echo "::error::Kernel image was not generated."
-            find out/arch/arm64/boot -maxdepth 2 -type f -print || true
+            echo "::error::Image.gz-dtb was not generated."
             exit 1
           fi
 
-          mkdir -p release
-          cp "$IMAGE" release/Image.gz-dtb
-          sha256sum release/Image.gz-dtb | tee release/SHA256SUMS
+          mkdir -p "$GITHUB_WORKSPACE/release"
 
+          cp "$IMAGE" "$GITHUB_WORKSPACE/release/Image.gz-dtb"
+
+          sha256sum "$GITHUB_WORKSPACE/release/Image.gz-dtb" \
+            | tee "$GITHUB_WORKSPACE/release/SHA256SUMS"
+
+          echo "Kernel image exists and is non-empty."
+
+      # ==========================================
+      # 10. SAVE BUILD INFORMATION
+      # ==========================================
       - name: Record build information
         shell: bash
         run: |
@@ -172,20 +401,30 @@ jobs:
           {
             echo "Project: Singularity"
             echo "Branch: event-horizon"
-            echo "Device: OnePlus 8 Pro (instantnoodlep)"
+            echo "Target: OnePlus 8 Pro (instantnoodlep)"
             echo "KernelSU Next: v3.4.2"
-            echo "Singularity commit: $(git -C kernel rev-parse HEAD)"
-            echo "KernelSU Next commit: $(git -C kernel/KernelSU-Next rev-parse HEAD)"
+            echo
+            echo "Singularity commit:"
+            git -C kernel rev-parse HEAD
+            echo
+            echo "KernelSU Next commit:"
+            git -C kernel/KernelSU-Next rev-parse HEAD
+            echo
             echo "Defconfig: ${{ steps.config.outputs.defconfig }}"
-            echo "Compiler: $(aarch64-linux-gnu-gcc --version | head -n 1)"
+            echo
+            echo "Compiler:"
+            "$REAL_CLANG" --version | head -n 1
           } > release/BUILD-INFO.txt
 
           cat release/BUILD-INFO.txt
 
+      # ==========================================
+      # 11. UPLOAD BUILD ARTIFACT
+      # ==========================================
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: singularity-instantnoodlep-ksunext-v3.4.2
+          name: singularity-ksunext-v3.4.2
           path: release/
           if-no-files-found: error
           retention-days: 14

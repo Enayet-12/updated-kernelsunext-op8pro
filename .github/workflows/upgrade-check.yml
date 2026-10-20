@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   prepare:
+    name: Verify Sources and Build Configuration
     runs-on: ubuntu-24.04
 
     steps:
@@ -17,44 +18,159 @@ jobs:
       - name: Install source tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y git
+          sudo apt-get install -y \
+            git \
+            ca-certificates \
+            python3
 
-      - name: Fetch Singularity source
+      - name: Fetch Singularity v17 source
         run: |
+          set -euo pipefail
+
           git clone \
             --branch event-horizon \
             --recurse-submodules \
             https://github.com/The-Anomalist/Singularity.git \
             kernel
 
-      - name: Select KernelSU Next v3.4.2
-        run: |
-          cd kernel/KernelSU-Next
-
-          git fetch \
-            https://github.com/KernelSU-Next/KernelSU-Next.git \
-            refs/tags/v3.4.2
-
-          git checkout --detach FETCH_HEAD
-
-          echo "Selected KernelSU Next revision:"
-          git log -1 --oneline
-
-      - name: Inspect kernel configuration
-        run: |
           cd kernel
 
-          echo "Kernel version:"
+          echo "========================================"
+          echo "SINGULARITY SOURCE"
+          echo "========================================"
+
+          echo "Branch:"
+          git branch --show-current
+
+          echo "Commit:"
+          git log -1 --format="%H %s"
+
+          echo "Submodule status:"
+          git submodule status
+
+      - name: Verify KernelSU Next v3.4.2
+        run: |
+          set -euo pipefail
+
+          cd kernel/KernelSU-Next
+
+          REPO="https://github.com/KernelSU-Next/KernelSU-Next.git"
+          TAG="v3.4.2"
+
+          echo "========================================"
+          echo "KERNELSU NEXT RELEASE VERIFICATION"
+          echo "========================================"
+
+          echo "Fetching release tag: ${TAG}"
+
+          git fetch --force "$REPO" \
+            "refs/tags/${TAG}:refs/tags/${TAG}"
+
+          if ! git show-ref --verify --quiet "refs/tags/${TAG}"; then
+            echo "::error::KernelSU Next tag ${TAG} was not found."
+            exit 1
+          fi
+
+          git checkout --detach "refs/tags/${TAG}"
+
+          echo
+          echo "Release tag:"
+          git describe --tags --exact-match HEAD
+
+          echo
+          echo "Selected commit:"
+          git log -1 --format="%H%n%s"
+
+          echo
+          echo "Commit details:"
+          git show -s --format=fuller HEAD
+
+          echo
+          echo "Submodule status:"
+          git submodule status
+
+          echo
+          echo "Source directory:"
+          ls -la
+
+      - name: Inspect Singularity build configuration
+        run: |
+          set -euo pipefail
+
+          cd kernel
+
+          echo "========================================"
+          echo "KERNEL VERSION"
+          echo "========================================"
+
           make -s kernelversion
 
-          echo "Available ARM64 configuration files:"
-          find arch/arm64/configs -type f \
-            \( -iname '*kona*' -o -iname '*oneplus*' \) \
+          echo
+          echo "========================================"
+          echo "ARM64 CONFIGURATION FILES"
+          echo "========================================"
+
+          find arch/arm64/configs \
+            -type f \
+            \( \
+              -iname '*kona*' \
+              -o -iname '*oneplus*' \
+              -o -iname '*instantnoodlep*' \
+              -o -iname '*sm8250*' \
+            \) \
             -print
 
-          echo "Build-related files:"
-          find . -maxdepth 2 -type f \
-            \( -name '*build*.sh' \
-            -o -name 'build.config*' \
-            -o -name 'Makefile' \) \
-            -print | head -100
+          echo
+          echo "========================================"
+          echo "BUILD SCRIPTS AND CONFIGURATION"
+          echo "========================================"
+
+          find . \
+            -path './.git' -prune -o \
+            -path './KernelSU-Next/.git' -prune -o \
+            -type f \
+            \( \
+              -name '*build*.sh' \
+              -o -name 'build.config*' \
+              -o -name 'Makefile' \
+              -o -name 'Android.bp' \
+            \) \
+            -print | head -150
+
+          echo
+          echo "========================================"
+          echo "KERNELSU NEXT INTEGRATION REFERENCES"
+          echo "========================================"
+
+          git grep -n -i \
+            -e 'kernelsu' \
+            -e 'ksu' \
+            -- ':!KernelSU-Next' \
+            || true
+
+      - name: Verify checkout consistency
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "FINAL SOURCE VERIFICATION"
+          echo "========================================"
+
+          echo "KernelSU Next HEAD:"
+          git -C kernel/KernelSU-Next rev-parse HEAD
+
+          echo
+          echo "KernelSU Next tag:"
+          git -C kernel/KernelSU-Next describe \
+            --tags --exact-match HEAD
+
+          echo
+          echo "Singularity commit:"
+          git -C kernel rev-parse HEAD
+
+          echo
+          echo "KernelSU Next working-tree status:"
+          git -C kernel/KernelSU-Next status --short
+
+          echo
+          echo "Source preparation completed."

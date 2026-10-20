@@ -17,22 +17,43 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # ==========================================
+      # 1. INSTALL BUILD DEPENDENCIES
+      # ==========================================
       - name: Install build dependencies
+        shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
-            git bc bison flex \
+            git \
+            bc \
+            bison \
+            flex \
             build-essential \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev \
+            libssl-dev \
+            libelf-dev \
             libncurses-dev \
-            python3 python3-pip \
-            rsync cpio zip unzip \
+            python3 \
+            python3-pip \
+            rsync \
+            cpio \
+            zip \
+            unzip \
             pahole
 
+      # ==========================================
+      # 2. CHECKOUT SINGULARITY
+      # ==========================================
       - name: Checkout Singularity
+        shell: bash
         run: |
+          set -euo pipefail
+
           git clone \
             --branch event-horizon \
             --recurse-submodules \
@@ -40,6 +61,14 @@ jobs:
             https://github.com/The-Anomalist/Singularity.git \
             kernel
 
+          echo "Singularity checkout completed."
+
+          echo "Kernel commit:"
+          git -C kernel log -1 --oneline
+
+      # ==========================================
+      # 3. CHECKOUT KERNELSU NEXT V3.4.2
+      # ==========================================
       - name: Select KernelSU Next v3.4.2
         working-directory: kernel/KernelSU-Next
         shell: bash
@@ -54,11 +83,19 @@ jobs:
 
           git checkout --detach "$TAG_COMMIT"
 
-          test "$(git rev-parse HEAD)" = "$TAG_COMMIT"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
 
-          echo "KernelSU Next tag: v3.4.2"
-          echo "KernelSU Next commit: $TAG_COMMIT"
+          if [ "$HEAD_COMMIT" != "$TAG_COMMIT" ]; then
+            echo "::error::KernelSU Next revision does not match v3.4.2."
+            exit 1
+          fi
 
+          echo "KernelSU Next release: v3.4.2"
+          echo "KernelSU Next commit: $HEAD_COMMIT"
+
+      # ==========================================
+      # 4. IDENTIFY ARM64 DEFCONFIG
+      # ==========================================
       - name: Identify kernel configuration
         id: config
         working-directory: kernel
@@ -66,8 +103,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Available candidate defconfigs:"
-          find arch/arm64/configs -type f \
+          echo "Searching for OnePlus 8 Pro / SM8250 configurations..."
+
+          find arch/arm64/configs \
+            -type f \
             \( -iname '*kona*defconfig' \
             -o -iname '*sm8250*defconfig' \
             -o -iname '*instantnoodlep*defconfig' \) \
@@ -91,42 +130,62 @@ jobs:
 
           if [ -z "$CONFIG" ]; then
             echo "::error::No recognized Kona/SM8250 defconfig found."
-            echo "Review the candidate list above and select the correct config."
+            echo "Cannot safely select a kernel configuration automatically."
             exit 1
           fi
 
           echo "Selected defconfig: $CONFIG"
           echo "defconfig=$CONFIG" >> "$GITHUB_OUTPUT"
 
-      - name: Verify kernel integration
+      # ==========================================
+      # 5. INSPECT KERNEL AND KSU INTEGRATION
+      # ==========================================
+      - name: Inspect kernel integration
         working-directory: kernel
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "===== Kernel revision ====="
+          echo "========================================"
+          echo "SINGULARITY SOURCE"
+          echo "========================================"
+
           git log -1 --oneline
 
           echo
-          echo "===== Kernel version ====="
+          echo "========================================"
+          echo "KERNEL VERSION"
+          echo "========================================"
+
           grep -E \
             '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)[[:space:]]*=' \
             Makefile || true
 
           echo
-          echo "===== KernelSU references ====="
+          echo "========================================"
+          echo "KERNELSU NEXT SOURCE"
+          echo "========================================"
+
+          git -C KernelSU-Next log -1 --oneline
+          git -C KernelSU-Next describe \
+            --tags --exact-match HEAD 2>/dev/null || true
+
+          echo
+          echo "========================================"
+          echo "KERNELSU INTEGRATION REFERENCES"
+          echo "========================================"
+
           git grep -n -i -E \
-            'KernelSU-Next/kernel|kernelsu|ksunext' \
+            'kernelsu|ksunext|CONFIG_KSU' \
             -- ':!KernelSU-Next' || true
 
           echo
-          echo "===== KernelSU source ====="
-          git -C KernelSU-Next log -1 --oneline
-
-          echo
-          echo "===== Selected defconfig ====="
+          echo "Selected defconfig:"
           echo "${{ steps.config.outputs.defconfig }}"
 
+      # ==========================================
+      # 6. CONFIGURE THE KERNEL
+      # ==========================================
       - name: Configure kernel
         working-directory: kernel
         shell: bash
@@ -135,64 +194,121 @@ jobs:
         run: |
           set -euo pipefail
 
-          make O="$GITHUB_WORKSPACE/out" \
+          mkdir -p "$GITHUB_WORKSPACE/out"
+
+          make \
+            O="$GITHUB_WORKSPACE/out" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             "$DEFCONFIG"
 
-          echo "===== KernelSU configuration ====="
-          grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_MODULES' \
-            "$GITHUB_WORKSPACE/out/.config" || true
+          echo
+          echo "========================================"
+          echo "IMPORTANT CONFIGURATION OPTIONS"
+          echo "========================================"
 
-          echo "===== Device configuration ====="
           grep -E \
-            'CONFIG_ARCH_QCOM|CONFIG_ARM64|CONFIG_OF=' \
+            'CONFIG_(KSU|KPROBES|MODULES|ARCH_QCOM|ARM64|OF)=' \
             "$GITHUB_WORKSPACE/out/.config" || true
 
+          echo
+          echo "Full configuration saved at:"
+          echo "$GITHUB_WORKSPACE/out/.config"
+
+      # ==========================================
+      # 7. COMPILE THE KERNEL
+      # ==========================================
       - name: Compile kernel
         working-directory: kernel
         shell: bash
+        env:
+          KCFLAGS: "-Wno-error=format -Wno-error=unused-variable"
         run: |
           set -euo pipefail
+
+          echo "========================================"
+          echo "COMPILING SINGULARITY"
+          echo "========================================"
+
+          echo "Architecture: arm64"
+          echo "KernelSU Next: v3.4.2"
+          echo "Compiler: AArch64 GCC"
+          echo "Warning workaround: enabled"
 
           make -j"$(nproc)" \
             O="$GITHUB_WORKSPACE/out" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS="$KCFLAGS" \
             Image.gz-dtb
 
+      # ==========================================
+      # 8. VERIFY BUILD OUTPUT
+      # ==========================================
       - name: Verify build artifacts
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "===== Output files ====="
-          find out/arch/arm64/boot -maxdepth 2 -type f -print
+          echo "========================================"
+          echo "KERNEL BUILD OUTPUT"
+          echo "========================================"
+
+          find out/arch/arm64/boot \
+            -maxdepth 2 \
+            -type f \
+            -print
 
           IMAGE="out/arch/arm64/boot/Image.gz-dtb"
 
           if [ ! -s "$IMAGE" ]; then
-            echo "::error::Image.gz-dtb was not produced."
+            echo "::error::Expected Image.gz-dtb was not produced."
             exit 1
           fi
 
           mkdir -p release
+
           cp "$IMAGE" release/Image.gz-dtb
 
           sha256sum release/Image.gz-dtb \
             | tee release/SHA256SUMS
 
+          echo
+          echo "Kernel image verified."
+
+      # ==========================================
+      # 9. WRITE BUILD INFORMATION
+      # ==========================================
+      - name: Record build information
+        shell: bash
+        run: |
+          set -euo pipefail
+
           {
-            echo "Singularity branch: event-horizon"
-            echo "Device target: OnePlus 8 Pro (instantnoodlep)"
-            echo "KernelSU Next tag: v3.4.2"
-            echo "Kernel commit:"
+            echo "Project: Singularity"
+            echo "Branch: event-horizon"
+            echo "Device: OnePlus 8 Pro"
+            echo "Device codename: instantnoodlep"
+            echo "KernelSU Next: v3.4.2"
+            echo
+            echo "Singularity commit:"
             git -C kernel rev-parse HEAD
+            echo
             echo "KernelSU Next commit:"
             git -C kernel/KernelSU-Next rev-parse HEAD
-            echo "Defconfig: ${{ steps.config.outputs.defconfig }}"
+            echo
+            echo "Defconfig:"
+            echo "${{ steps.config.outputs.defconfig }}"
+            echo
+            echo "Compiler:"
+            aarch64-linux-gnu-gcc --version | head -n 1
           } > release/BUILD-INFO.txt
 
+          cat release/BUILD-INFO.txt
+
+      # ==========================================
+      # 10. UPLOAD BUILD ARTIFACT
+      # ==========================================
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:
